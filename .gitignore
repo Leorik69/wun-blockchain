@@ -14,3 +14,7 @@ Thumbs.db
 *.tsbuildinfo
 .vscode/
 .idea/
+
+# Local marketplace-template publishing material (never part of the public repo)
+TEMPLATE_README.md
+_tpl-*.graphql
