@@ -1,0 +1,1347 @@
+openapi: 3.0.3
+info:
+  title: WUNCoin Blockchain API
+  version: 1.0.0
+  description: |
+    REST + WebSocket API over the WUNCoin blockchain: Proof-of-Work consensus,
+    ECDSA-signed transactions, smart contracts (WUNCoin / Staking; MultiSig is
+    planned and not yet implemented),
+    optional Postgres persistence and an optional Redis cross-replica scaling
+    layer.
+
+    ## Conventions
+    - Every JSON route returns a `{ success, ... }` envelope. Handled errors use
+      `{ "success": false, "error": "<message>" }` with an appropriate status.
+    - **Authentication**: protected routes require the `x-api-key` header. The
+      gate FAILS CLOSED in production (503 when `BLOCKCHAIN_API_KEY` is unset,
+      401 on a wrong/missing key). In dev/test with no key configured the gate is
+      permissive.
+    - **Rate limiting**: most routes are behind a per-IP limiter (default
+      120 req / 60 s, `429` on breach). It is bypassed when `NODE_ENV=test`.
+      Redis-backed (shared across replicas) when `REDIS_URL` is set.
+    - **Read caching**: read-only blockchain endpoints set
+      `Cache-Control: public, max-age=5`.
+    - **Request bodies** are capped at `100kb`.
+    - A future `/api/v1/...` prefix is reserved; existing paths are unchanged.
+
+    ## WebSockets
+    In addition to REST, the service exposes a WebSocket hub on the same port for
+    `transaction_added` and `block_mined` events. When `REQUIRE_WS_AUTH=true`,
+    clients authenticate by offering `Sec-WebSocket-Protocol: ["wun-auth-v1", "<key>"]`
+    (preferred — keeps the key out of proxy/access logs); the legacy
+    `Sec-WebSocket-Protocol: wun.auth.<key>` token and the deprecated `?key=<key>`
+    query parameter are still accepted. (WebSockets are not described by OpenAPI.)
+
+    ## Optional subsystems (dormant by default)
+    - Persistence (Postgres) is inactive unless `DATABASE_URL` is set.
+    - Redis scaling (distributed rate limit, mining lock, WS fan-out) is inactive
+      unless `REDIS_URL` is set.
+  contact:
+    name: WUN Team
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:3001
+    description: Local development
+  - url: https://{host}
+    description: Deployed instance (Railway/Render)
+    variables:
+      host:
+        default: blockchain.example.internal
+
+tags:
+  - name: system
+    description: Deploy identity, health, readiness and metrics.
+  - name: blockchain
+    description: Chain info, blocks, single block and validation.
+  - name: transactions
+    description: Sign, submit and query transactions.
+  - name: mining
+    description: Synchronous and asynchronous Proof-of-Work mining.
+  - name: balance
+    description: Address balance and transaction history.
+  - name: keys
+    description: ECDSA key-pair generation.
+  - name: logs
+    description: Structured logging buffer (protected).
+
+security: []
+
+paths:
+  /api/version:
+    get:
+      tags: [system]
+      summary: Deploy identity and spec version
+      description: >
+        Returns the resolved git SHA (RAILWAY_GIT_COMMIT_SHA → GITHUB_SHA →
+        VERCEL_GIT_COMMIT_SHA, else "unknown"), the active NODE_ENV and the
+        OpenAPI schema version this build implements. Unauthenticated.
+      operationId: getVersion
+      responses:
+        "200":
+          description: Deploy identity.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    required: [git_sha, node_env, openapi]
+                    properties:
+                      git_sha:
+                        type: string
+                        example: "unknown"
+                      node_env:
+                        type: string
+                        example: production
+                      openapi:
+                        type: string
+                        description: OpenAPI spec version (Phase 8.4, additive).
+                        example: 1.0.0
+
+  /api/health:
+    get:
+      tags: [system]
+      summary: Liveness probe
+      description: >
+        O(1) liveness. Always returns 200 while the process is up. Wire shape is
+        guarded by the golden-master contract test. Unauthenticated.
+      operationId: getHealth
+      responses:
+        "200":
+          description: Process is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, status, timestamp]
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  status:
+                    type: string
+                    enum: [OK]
+                  timestamp:
+                    type: string
+                    format: date-time
+                  git_sha:
+                    type: string
+                    nullable: true
+
+  /api/health/ready:
+    get:
+      tags: [system]
+      summary: Readiness probe
+      description: >
+        Returns 200 when the service can accept traffic, 503 when a dependency is
+        unhealthy. Checks blockchain boot, write-path health (persistence mode)
+        and mining-pool liveness. In in-memory mode readiness is satisfied by
+        boot alone. Unauthenticated (orchestrator/load-balancer probe).
+      operationId: getReadiness
+      responses:
+        "200":
+          description: Service is ready.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Readiness"
+        "503":
+          description: Service is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Readiness"
+
+  /api/metrics:
+    get:
+      tags: [system]
+      summary: Prometheus metrics
+      description: >
+        Prometheus text exposition format (`wun_`-prefixed metric families).
+        API-key gated in production; open in dev/test where no key is configured.
+      operationId: getMetrics
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Metrics in text exposition format.
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: |
+                  # HELP wun_chain_height Current chain height
+                  # TYPE wun_chain_height gauge
+                  wun_chain_height 1
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/ServerError"
+        "503":
+          $ref: "#/components/responses/KeyNotConfigured"
+
+  /api/blockchain/info:
+    get:
+      tags: [blockchain]
+      summary: Blockchain information
+      operationId: getBlockchainInfo
+      responses:
+        "200":
+          description: Chain summary.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    $ref: "#/components/schemas/BlockchainInfo"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/blockchain/blocks:
+    get:
+      tags: [blockchain]
+      summary: Paginated blocks (newest first)
+      description: >
+        Returns a page of blocks ordered newest-first. Use `before` (an exclusive
+        block index) to page backwards through history. Cold (evicted) blocks are
+        transparently lazy-loaded from Postgres when persistence is active.
+      operationId: getBlocks
+      parameters:
+        - name: limit
+          in: query
+          description: Page size (clamped to 1..100).
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: before
+          in: query
+          description: >
+            Exclusive upper bound block index. Must be a valid index in
+            `[0, chainLength)`; otherwise 400.
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "200":
+          description: A page of blocks.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data, pagination]
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Block"
+                  pagination:
+                    $ref: "#/components/schemas/BlocksPagination"
+        "400":
+          description: Invalid `before` parameter.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/blockchain/chain:
+    get:
+      tags: [blockchain]
+      summary: Full blockchain
+      operationId: getChain
+      responses:
+        "200":
+          description: The full chain.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data, length]
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Block"
+                  length:
+                    type: integer
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/blockchain/chain/{blockIndex}:
+    get:
+      tags: [blockchain]
+      summary: Single block by index
+      description: >
+        Returns the block at `blockIndex`. Non-integer or negative values return
+        400; a valid index beyond the chain height returns 404. Cold blocks are
+        lazy-loaded when persistence is active.
+      operationId: getBlockByIndex
+      parameters:
+        - $ref: "#/components/parameters/BlockIndex"
+      responses:
+        "200":
+          description: The block.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    $ref: "#/components/schemas/Block"
+        "400":
+          description: Invalid block index (non-integer or negative).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Block not found (index out of range).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/validate:
+    post:
+      tags: [blockchain]
+      summary: Validate the full chain
+      description: >
+        Runs `isChainValid` (hash linkage, PoW, per-block difficulty schedule and
+        signature checks). Served from an O(1) cache when the chain is unchanged.
+      operationId: validateChain
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Validation result.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, isValid, message]
+                properties:
+                  success:
+                    type: boolean
+                  isValid:
+                    type: boolean
+                  message:
+                    type: string
+                    example: Blockchain is valid
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerError"
+        "503":
+          $ref: "#/components/responses/KeyNotConfigured"
+
+  /api/keys/generate:
+    post:
+      tags: [keys]
+      summary: Generate an ECDSA key pair
+      operationId: generateKeys
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: A fresh key pair.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, keyPair, message]
+                properties:
+                  success:
+                    type: boolean
+                  keyPair:
+                    $ref: "#/components/schemas/KeyPair"
+                  message:
+                    type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerError"
+        "503":
+          $ref: "#/components/responses/KeyNotConfigured"
+
+  /api/transactions/sign:
+    post:
+      tags: [transactions]
+      summary: Sign a transaction (server-side)
+      description: >
+        Convenience signing endpoint. DISABLED in production unless
+        `ALLOW_SIGN_ENDPOINT=true` (returns 403). Clients should normally sign
+        locally and submit to `POST /api/transactions`.
+      operationId: signTransaction
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [transaction, privateKey]
+              properties:
+                transaction:
+                  $ref: "#/components/schemas/TransactionInput"
+                privateKey:
+                  type: string
+                  description: Hex private key used to sign.
+      responses:
+        "200":
+          description: Signature produced.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, signature, message]
+                properties:
+                  success:
+                    type: boolean
+                  signature:
+                    type: string
+                  message:
+                    type: string
+        "400":
+          description: Missing transaction or privateKey.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Signing endpoint disabled in production.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerError"
+        "503":
+          $ref: "#/components/responses/KeyNotConfigured"
+
+  /api/transactions:
+    post:
+      tags: [transactions]
+      summary: Submit a transaction to the mempool
+      description: >
+        Validates and normalizes the payload, adds it to the pending pool,
+        registers it as `pending` in the status tracker and broadcasts
+        `transaction_added` over WebSocket. Ordinary (non-mint, non-TREASURY)
+        transfers must be signed and carry client-provided `id`/`timestamp`. The
+        mempool is bounded (`MAX_PENDING_TX`); overflow returns 503.
+      operationId: createTransaction
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TransactionInput"
+      responses:
+        "200":
+          description: Transaction accepted into the pending pool.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, transaction, status, message]
+                properties:
+                  success:
+                    type: boolean
+                  transaction:
+                    $ref: "#/components/schemas/Transaction"
+                  status:
+                    type: string
+                    enum: [pending]
+                  message:
+                    type: string
+        "400":
+          description: Validation or business-rule rejection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerError"
+        "503":
+          description: Transaction pool full (back off and retry), or API key not configured.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/transactions/pending:
+    get:
+      tags: [transactions]
+      summary: Pending transaction count
+      description: O(1) count of the mempool (avoids a full chain validation).
+      operationId: getPendingCount
+      responses:
+        "200":
+          description: Pending count.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, pendingCount, message]
+                properties:
+                  success:
+                    type: boolean
+                  pendingCount:
+                    type: integer
+                  message:
+                    type: string
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/transactions/{txId}/status:
+    get:
+      tags: [transactions]
+      summary: Transaction status by id
+      operationId: getTransactionStatus
+      parameters:
+        - name: txId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Transaction lifecycle status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, transactionId, status, timestamp, updatedAt]
+                properties:
+                  success:
+                    type: boolean
+                  transactionId:
+                    type: string
+                  status:
+                    type: string
+                    enum: [pending, confirmed, failed]
+                  blockIndex:
+                    type: integer
+                    nullable: true
+                  blockHash:
+                    type: string
+                    nullable: true
+                  error:
+                    type: string
+                    nullable: true
+                  timestamp:
+                    type: integer
+                    format: int64
+                  updatedAt:
+                    type: integer
+                    format: int64
+        "404":
+          description: Transaction not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/transactions/status/all:
+    get:
+      tags: [transactions]
+      summary: All transaction statuses (paginated)
+      description: >
+        Summary counters always describe the FULL set; `statuses` is the requested
+        page.
+      operationId: getAllTransactionStatuses
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Status summary plus a page of statuses.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, total, pending, confirmed, failed, statuses, pagination]
+                properties:
+                  success:
+                    type: boolean
+                  total:
+                    type: integer
+                  pending:
+                    type: integer
+                  confirmed:
+                    type: integer
+                  failed:
+                    type: integer
+                  statuses:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TransactionStatus"
+                  pagination:
+                    $ref: "#/components/schemas/OffsetPagination"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/mining/mine:
+    post:
+      tags: [mining]
+      summary: Mine a block (synchronous)
+      description: >
+        Mines the pending set and returns the block in the same response. Runs
+        under the SAME single-flight + distributed lock as the async job path, so
+        concurrent calls coalesce (never double-mine). FAILS CLOSED (500) when a
+        configured distributed lock cannot be acquired. 400 when there is nothing
+        to mine or validation failed.
+      operationId: mineBlock
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MineRequest"
+      responses:
+        "200":
+          description: Block mined.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, block, message]
+                properties:
+                  success:
+                    type: boolean
+                  block:
+                    $ref: "#/components/schemas/Block"
+                  message:
+                    type: string
+        "400":
+          description: Missing minerAddress, or no transactions to mine / validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          description: Mining failed or the distributed lock refused (fail-closed).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          $ref: "#/components/responses/KeyNotConfigured"
+
+  /api/mining/jobs:
+    post:
+      tags: [mining]
+      summary: Start an async mining job
+      description: >
+        Starts mining in the background and returns `202` with a `jobId`; poll
+        `GET /api/mining/jobs/{jobId}`. Coalesces onto an in-flight job when one
+        exists. Returns 503 when the worker pool is unavailable (e.g. the test
+        harness spawns no pool).
+      operationId: createMiningJob
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MineRequest"
+      responses:
+        "202":
+          description: Mining job started (or coalesced onto an in-flight job).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, jobId, status, coalesced, message]
+                properties:
+                  success:
+                    type: boolean
+                  jobId:
+                    type: string
+                  status:
+                    type: string
+                    enum: [mining]
+                  coalesced:
+                    type: boolean
+                  message:
+                    type: string
+        "400":
+          description: Missing minerAddress.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerError"
+        "503":
+          description: Async mining unavailable, or API key not configured.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/mining/jobs/{jobId}:
+    get:
+      tags: [mining]
+      summary: Poll an async mining job
+      operationId: getMiningJob
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Job state.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - type: object
+                    required: [success]
+                    properties:
+                      success:
+                        type: boolean
+                  - $ref: "#/components/schemas/MiningJob"
+        "404":
+          description: Job not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/balance/{address}:
+    get:
+      tags: [balance]
+      summary: Address balance and nonce
+      operationId: getBalance
+      parameters:
+        - $ref: "#/components/parameters/Address"
+      responses:
+        "200":
+          description: Balance and contract-state nonce.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, address, balance, nonce]
+                properties:
+                  success:
+                    type: boolean
+                  address:
+                    type: string
+                  balance:
+                    type: number
+                  nonce:
+                    type: integer
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/address/{address}/history:
+    get:
+      tags: [balance]
+      summary: Address transaction history (paginated)
+      description: >
+        Served by an indexed query when persistence is active, otherwise by an
+        in-memory scan. The response shape is identical either way.
+      operationId: getAddressHistory
+      parameters:
+        - $ref: "#/components/parameters/Address"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Transaction history page.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, address, transactions, count, pagination]
+                properties:
+                  success:
+                    type: boolean
+                  address:
+                    type: string
+                  transactions:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Transaction"
+                  count:
+                    type: integer
+                  pagination:
+                    $ref: "#/components/schemas/OffsetPagination"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/logs/stats:
+    get:
+      tags: [logs]
+      summary: Logging statistics
+      operationId: getLogStats
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Log buffer statistics.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, stats]
+                properties:
+                  success:
+                    type: boolean
+                  stats:
+                    $ref: "#/components/schemas/LogStats"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerError"
+        "503":
+          $ref: "#/components/responses/KeyNotConfigured"
+
+  /api/logs:
+    get:
+      tags: [logs]
+      summary: List logs (filtered)
+      operationId: listLogs
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: level
+          in: query
+          description: Filter by level (case-insensitive; uppercased internally).
+          schema:
+            type: string
+            enum: [INFO, WARN, ERROR, DEBUG]
+        - name: limit
+          in: query
+          description: Return only the last N log entries.
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "200":
+          description: Log entries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, count, logs]
+                properties:
+                  success:
+                    type: boolean
+                  count:
+                    type: integer
+                  logs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/LogEntry"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerError"
+        "503":
+          $ref: "#/components/responses/KeyNotConfigured"
+
+  /api/logs/export:
+    post:
+      tags: [logs]
+      summary: Export logs as a downloadable JSON file
+      operationId: exportLogs
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: >
+            The exported log array as an attachment
+            (`Content-Disposition: attachment; filename="blockchain-logs-<ts>.json"`).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/LogEntry"
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerError"
+        "503":
+          $ref: "#/components/responses/KeyNotConfigured"
+
+  /api/logs/clear:
+    post:
+      tags: [logs]
+      summary: Clear the log buffer
+      operationId: clearLogs
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Log buffer cleared.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, message]
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                    example: Logs cleared
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerError"
+        "503":
+          $ref: "#/components/responses/KeyNotConfigured"
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: >
+        Shared secret from `BLOCKCHAIN_API_KEY`. Required in production (fails
+        closed with 503 when unset); permissive in dev/test when unconfigured.
+
+  parameters:
+    Address:
+      name: address
+      in: path
+      required: true
+      description: >
+        Account address. ECDSA addresses are `0x` + 40 hex chars; well-known
+        accounts such as `TREASURY` are also accepted.
+      schema:
+        type: string
+    BlockIndex:
+      name: blockIndex
+      in: path
+      required: true
+      description: Non-negative block index. Non-integer/negative → 400.
+      schema:
+        type: integer
+        minimum: 0
+    Limit:
+      name: limit
+      in: query
+      description: Page size (clamped to 1..200).
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    Offset:
+      name: offset
+      in: query
+      description: Page offset (>= 0).
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid API key.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    KeyNotConfigured:
+      description: Production API key not configured (fail-closed).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RateLimited:
+      description: Rate limit exceeded.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            success: false
+            error: Rate limit exceeded
+    ServerError:
+      description: Internal server error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Error:
+      type: object
+      required: [success, error]
+      properties:
+        success:
+          type: boolean
+          enum: [false]
+        error:
+          type: string
+
+    Readiness:
+      type: object
+      required: [status, checks, timestamp]
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+        checks:
+          type: object
+          additionalProperties:
+            type: boolean
+          description: >
+            May include `blockchainBooted`, `writeHealthy` and `miningPoolAlive`
+            (the latter two only when the kernel has booted).
+        timestamp:
+          type: string
+          format: date-time
+
+    BlockchainInfo:
+      type: object
+      required: [chainLength, pendingTransactions, difficulty, validators, consensus, isValid]
+      properties:
+        chainLength:
+          type: integer
+        pendingTransactions:
+          type: integer
+        difficulty:
+          type: integer
+        validators:
+          type: array
+          items:
+            type: string
+        consensus:
+          type: string
+          example: POW
+        isValid:
+          type: boolean
+        writeDegraded:
+          type: boolean
+
+    TransactionType:
+      type: string
+      enum: [transfer, mint, burn, stake, anchor]
+
+    TransactionInput:
+      type: object
+      description: >
+        Inbound transaction payload. `from`, `to`, `amount`, `type` and `nonce`
+        are required. Signed (non-mint, non-TREASURY) transfers must also carry
+        `id`, `timestamp`, `signature` and `publicKey`.
+      required: [from, to, amount, type, nonce]
+      properties:
+        id:
+          type: string
+        from:
+          type: string
+        to:
+          type: string
+        amount:
+          oneOf:
+            - type: number
+            - type: string
+          description: Numeric (parsed with parseFloat).
+        nonce:
+          oneOf:
+            - type: integer
+            - type: string
+        timestamp:
+          oneOf:
+            - type: integer
+            - type: string
+        type:
+          $ref: "#/components/schemas/TransactionType"
+        publicKey:
+          type: string
+        signature:
+          type: string
+        metadata:
+          type: object
+          maxProperties: 16
+          additionalProperties: true
+          description: >
+            Optional free-form annotation. It is stored permanently, hashed into
+            the block `txRoot` and covered by the sender signature, so the server
+            validates it and never normalizes it (any rewrite would desynchronize
+            the signed bytes). Bounds: flat object of primitive values only, at
+            most 16 keys, snake_case keys up to 32 chars, string values up to 256
+            chars, `JSON.stringify(metadata)` up to 2048 bytes. Values JSON would
+            drop or rewrite (undefined, functions, NaN, Infinity) are rejected.
+            `anchor` transactions additionally require a positive integer
+            `anchor_version`. Violations return 400.
+
+    Transaction:
+      type: object
+      required: [id, from, to, amount, timestamp, nonce, type]
+      properties:
+        id:
+          type: string
+        from:
+          type: string
+        to:
+          type: string
+        amount:
+          type: number
+        timestamp:
+          type: integer
+          format: int64
+        nonce:
+          type: integer
+        publicKey:
+          type: string
+        signature:
+          type: string
+        type:
+          $ref: "#/components/schemas/TransactionType"
+        metadata:
+          type: object
+          additionalProperties: true
+          description: >
+            Stored annotation; always satisfies the inbound metadata policy
+            documented on TransactionInput.
+
+    TransactionStatus:
+      type: object
+      required: [id, status, timestamp, updatedAt]
+      properties:
+        id:
+          type: string
+        status:
+          type: string
+          enum: [pending, confirmed, failed]
+        blockIndex:
+          type: integer
+        blockHash:
+          type: string
+        error:
+          type: string
+        timestamp:
+          type: integer
+          format: int64
+        updatedAt:
+          type: integer
+          format: int64
+
+    Block:
+      type: object
+      required: [index, timestamp, transactions, previousHash, hash, nonce, miner, difficulty]
+      properties:
+        index:
+          type: integer
+        timestamp:
+          type: integer
+          format: int64
+        transactions:
+          type: array
+          items:
+            $ref: "#/components/schemas/Transaction"
+        previousHash:
+          type: string
+        hash:
+          type: string
+        nonce:
+          type: integer
+        miner:
+          type: string
+        difficulty:
+          type: integer
+        version:
+          type: integer
+          description: 1 = legacy full-JSON hashing, 2 = txRoot-based hashing.
+        txRoot:
+          type: string
+          description: Transaction root (version 2 blocks only).
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Genesis carries `{ chainId }`.
+
+    KeyPair:
+      type: object
+      required: [privateKey, publicKey, address]
+      properties:
+        privateKey:
+          type: string
+        publicKey:
+          type: string
+        address:
+          type: string
+          pattern: "^0x[0-9a-fA-F]{40}$"
+
+    MineRequest:
+      type: object
+      required: [minerAddress]
+      properties:
+        minerAddress:
+          type: string
+          description: Reward recipient for the mined block.
+
+    MiningJob:
+      type: object
+      required: [id, status, startedAt]
+      properties:
+        id:
+          type: string
+        status:
+          type: string
+          enum: [pending, mining, completed, failed]
+        minerAddress:
+          type: string
+        result:
+          type: object
+          nullable: true
+          properties:
+            nonce:
+              type: integer
+            hash:
+              type: string
+        block:
+          allOf:
+            - $ref: "#/components/schemas/Block"
+          nullable: true
+        error:
+          type: string
+        startedAt:
+          type: integer
+          format: int64
+        completedAt:
+          type: integer
+          format: int64
+
+    LogEntry:
+      type: object
+      properties:
+        level:
+          type: string
+        message:
+          type: string
+        timestamp:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+
+    LogStats:
+      type: object
+      required: [total, byLevel]
+      properties:
+        total:
+          type: integer
+        byLevel:
+          type: object
+          additionalProperties:
+            type: integer
+
+    BlocksPagination:
+      type: object
+      required: [limit, count, hasMore, totalBlocks]
+      properties:
+        limit:
+          type: integer
+        count:
+          type: integer
+        hasMore:
+          type: boolean
+        nextBefore:
+          type: integer
+          nullable: true
+          description: Index to pass as `before` for the next (older) page.
+        totalBlocks:
+          type: integer
+
+    OffsetPagination:
+      type: object
+      required: [limit, offset, total]
+      properties:
+        limit:
+          type: integer
+        offset:
+          type: integer
+        total:
+          type: integer

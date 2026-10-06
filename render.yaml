@@ -1,0 +1,31 @@
+# Render deployment for the WUNCoin test-net blockchain server.
+# Long-running Docker web service (Express REST + WebSocket).
+services:
+  - type: web
+    name: wun-blockchain-testnet
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter
+    healthCheckPath: /api/health/ready
+    envVars:
+      - key: PORT
+        value: 3001
+      - key: NODE_ENV
+        value: production
+      # Set in dashboard (do not commit secrets):
+      - key: BLOCKCHAIN_API_KEY
+        sync: false
+      # Comma-separated, no spaces. Add your own frontend origins here.
+      - key: CORS_ORIGINS
+        value: http://localhost:8080,http://localhost:8081,http://localhost:5173,http://127.0.0.1:8080,http://127.0.0.1:8081,http://127.0.0.1:5173
+      # Keep signing endpoint disabled in prod unless explicitly needed.
+      - key: ALLOW_SIGN_ENDPOINT
+        value: "false"
+      # Custodial bridge (mirror off-chain WUNCoin to on-chain); set in dashboard:
+      - key: BRIDGE_ADDRESS
+        sync: false
+      - key: BRIDGE_PRIVATE_KEY
+        sync: false
+      - key: BRIDGE_GENESIS_BALANCE
+        value: "100000"

@@ -1,0 +1,65 @@
+{
+  "name": "@wun/blockchain",
+  "version": "1.0.0",
+  "description": "WUNCoin Blockchain - Proof of Work consensus with smart contracts",
+  "main": "dist/src/blockchain.js",
+  "types": "dist/src/blockchain.d.ts",
+  "scripts": {
+    "dev": "npx ts-node src/server.ts",
+    "build": "tsc",
+    "start": "node dist/src/server.js",
+    "start:prod": "ts-node --transpile-only src/server.ts",
+    "test": "vitest run",
+    "test:legacy": "npx ts-node --transpile-only tests/blockchain.test.ts",
+    "test:contract": "vitest run tests/http",
+    "test:watch": "nodemon --exec \"npx ts-node\" tests/blockchain.test.ts",
+    "typecheck": "tsc --noEmit",
+    "bench": "vitest bench --run tests/perf/pow.bench.ts",
+    "perf:http": "npx ts-node --transpile-only tests/perf/http.load.ts",
+    "perf:soak": "npx ts-node --transpile-only tests/perf/soak.ts",
+    "perf": "npm run bench && npm run perf:http && npm run perf:soak",
+    "lint": "eslint .",
+    "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\" \"contracts/**/*.ts\""
+  },
+  "keywords": [
+    "blockchain",
+    "cryptocurrency",
+    "wuncoin",
+    "smart-contracts"
+  ],
+  "author": "WUN Team",
+  "license": "MIT",
+  "dependencies": {
+    "@noble/secp256k1": "^3.0.0",
+    "compression": "^1.7.4",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "helmet": "^8.0.0",
+    "ioredis": "^5.4.1",
+    "pg": "^8",
+    "prom-client": "^15.1.3",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "@types/compression": "^1.7.5",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.10.6",
+    "@types/pg": "^8",
+    "@types/supertest": "^6.0.0",
+    "@types/ws": "^8.5.10",
+    "eslint": "^9.0.0",
+    "globals": "^15.0.0",
+    "nodemon": "^3.0.2",
+    "prettier": "^3.1.1",
+    "supertest": "^7.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3",
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
